@@ -1,0 +1,352 @@
+---
+title: "Predictive modeling using the Weight Lifting Dataset"
+author: "BEYDIA Mohamed"
+date: "24 FEB 2018"
+output: 
+  html_document:
+    keep_md: yes
+  md_document:
+    variant: markdown_github
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, fig.width=10, fig.height=5)
+options(width=120)
+
+library(lattice)
+library(ggplot2)
+library(plyr)
+library(dplyr)
+library(xgboost)
+```
+
+## Outline
+
+The aim of this project is to train a predictive model allowing to predict what exercise was performed using a data set provide by HAR [http://groupware.les.inf.puc-rio.br/har] and using 159 features.
+
+
+We'll proceed as follows
+
+- Download the data
+- Do some preprocessing
+- Explore the data,focusing on the parameters we are interested in 
+- Model selection, where we try different models to help us answer our questions
+- Model examination, to see  which model is the best one 
+- A Conclusion where we answer the questions based on the data
+- Final Prediction on the test set using our best model 
+
+## 1-Data Dowloading & Reading
+```{r}
+setwd("C:/Users/mlemi/Desktop/COURSERA/Data_science_sp/pratical_machine_learning")
+
+training_url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+test_url     <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+
+download.file(training_url,"pml-training.csv")
+download.file(test_url,"pml-testing.csv")
+
+```
+
+
+```{r}
+training_set <- read.csv("pml-training.csv")
+testing_set <- read.csv("pml-testing.csv")
+```
+
+## 2-Exploratory data analyses 
+
+Let's have a look at the shape and some statistics of the data sets
+```{r}
+## shape,dimensions
+dim(training_set)
+dim(testing_set)
+
+##  head
+#head(training_set)
+#head(testing_set)
+
+
+## summary statistics useless for the moment
+#summary(training_set)
+#summary(testing_set)
+
+```
+
+Let's check for missing values and exclude them if there are not so much
+
+```{r}
+head(apply(is.na(training_set),2,sum)) #  allow us to see how much missing values per variable we have 
+# removing missing values, 20%
+maxNAPerc = 20
+maxNACount <- nrow(training_set) / 100 * maxNAPerc
+removeColumns <- which(colSums(is.na(training_set) | training_set=="") > maxNACount)
+training.cleaned01 <- training_set[,-removeColumns]
+testing.cleaned01 <- testing_set[,-removeColumns]
+```
+
+Let's remove all time related data, since we won't use those
+
+```{r}
+removeColumns <- grep("timestamp", names(training.cleaned01))
+training.cleaned02 <- training.cleaned01[,-c(1, removeColumns )]
+testing.cleaned02 <- testing.cleaned01[,-c(1, removeColumns )]
+```
+
+After that we convert all factors to integers
+```{r}
+classeLevels <- levels(training.cleaned02$classe)
+training.cleaned03 <- data.frame(data.matrix(training.cleaned02))
+training.cleaned03$classe <- factor(training.cleaned03$classe, labels=classeLevels)
+testing.cleaned03 <- data.frame(data.matrix(testing.cleaned02))
+```
+
+Finally set the data set to be explored
+
+```{r}
+training.cleaned <- training.cleaned03
+testing.cleaned <- testing.cleaned03
+```
+
+
+## 3-Cross validation 
+
+Now we're going to do cross validation by spliting the train set into a sub train set (75% of the training) and a sub test set (25% of the training) , this will allow us to check the performance of our model on the sub test before predicting on the final test.  
+
+```{r}
+set.seed(19791108)
+library(caret)
+
+classeIndex <- which(names(training.cleaned) == "classe")
+
+partition <- createDataPartition(y=training.cleaned$classe, p=0.75, list=FALSE)
+training.subSetTrain <- training.cleaned[partition, ]
+training.subSetTest <- training.cleaned[-partition, ]
+```
+
+Let's check if there are some fields that high correlations with our target variable (class)
+
+```{r}
+correlations <- cor(training.subSetTrain[, -classeIndex], as.numeric(training.subSetTrain$classe))
+bestCorrelations <- subset(as.data.frame(as.table(correlations)), abs(Freq)>0.3)
+bestCorrelations
+```
+
+We can see that even the best correlations with class are hardly above 0.3
+Let's check visually if there is indeed hard to use these 2 as possible simple linear predictors.
+
+```{r}
+library(Rmisc)
+library(ggplot2)
+
+p1 <- ggplot(training.subSetTrain, aes(classe,pitch_forearm)) + 
+  geom_boxplot(aes(fill=classe))
+
+p2 <- ggplot(training.subSetTrain, aes(classe, magnet_arm_x)) + 
+  geom_boxplot(aes(fill=classe))
+
+multiplot(p1,p2,cols=2)
+```
+
+Clearly there is no hard separation of classes possible using only these 'highly' correlated features.
+
+## 4-Model selection 
+
+Let's identify variables with high correlations among each other in our set, so we can possibly exclude them from the training set using PCA for instance . 
+
+We will check afterwards if these modifications to the data set make the model more accurate (and perhaps even faster)
+
+```{r}
+library(corrplot)
+correlationMatrix <- cor(training.subSetTrain[, -classeIndex])
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.9, exact=TRUE)
+excludeColumns <- c(highlyCorrelated, classeIndex)
+corrplot(correlationMatrix, method="color", type="lower", order="hclust", tl.cex=0.70, tl.col="black", tl.srt = 45, diag = FALSE)
+```
+
+We see that there are some features that are quite correlated with each other.
+We will have a model with these excluded. Also we'll try and reduce the features by running PCA on all and the excluded subset of the features
+
+```{r}
+pcaPreProcess.all <- preProcess(training.subSetTrain[, -classeIndex], method = "pca", thresh = 0.99)
+training.subSetTrain.pca.all <- predict(pcaPreProcess.all, training.subSetTrain[, -classeIndex])
+training.subSetTest.pca.all <- predict(pcaPreProcess.all, training.subSetTest[, -classeIndex])
+testing.pca.all <- predict(pcaPreProcess.all, testing.cleaned[, -classeIndex])
+
+
+pcaPreProcess.subset <- preProcess(training.subSetTrain[, -excludeColumns], method = "pca", thresh = 0.99)
+training.subSetTrain.pca.subset <- predict(pcaPreProcess.subset, training.subSetTrain[, -excludeColumns])
+training.subSetTest.pca.subset <- predict(pcaPreProcess.subset, training.subSetTest[, -excludeColumns])
+testing.pca.subset <- predict(pcaPreProcess.subset, testing.cleaned[, -classeIndex])
+```
+
+Now we'll do some Random forest and Xgboost training. Xgboost is very fast algorithm and generally it perform better than  random_forest but it require some special transformations because it deals only with matrices .
+
+### Random Forest
+We will use simple random forest without tuning the parameters .
+
+```{r}
+library(randomForest)
+
+
+#Random Forest 
+# Training models
+RF.cleaned <- randomForest(training.subSetTrain$classe ~ ., data = training.subSetTrain[, -classeIndex])
+RF.exclude <- randomForest(training.subSetTrain$classe ~ ., data = training.subSetTrain[, -excludeColumns])
+RF.pca_all <- randomForest(training.subSetTrain$classe ~ ., data = training.subSetTrain.pca.all)
+RF.pca_subset<- randomForest(training.subSetTrain$classe ~ ., data = training.subSetTrain.pca.subset)
+```
+
+### predict on test set
+
+```{r}
+RF.cleaned.pred<-predict(RF.cleaned,training.subSetTest[, -classeIndex])
+RF.exclude.pred<-predict(RF.exclude,training.subSetTest[, -excludeColumns])
+RF.pca_all.pred<-predict(RF.pca_all,training.subSetTest.pca.all)
+RF.pca_subset.pred<-predict(RF.pca_subset,training.subSetTest.pca.subset)
+
+
+```
+
+### Xgboost
+We will prepare the data first and then we will run an xgboost tree without tunning the parameters
+
+```{r}
+
+library(xgboost)
+
+#create labels by converting factor to numeric 
+subtrn_labels <- as.numeric(training.subSetTrain$classe)-1
+subtst_label <- as.numeric(training.subSetTest$classe)-1
+
+
+
+##Create matricies according to different models
+# Case 1 : cleaned
+subtrain_cleaned <- xgb.DMatrix(data =data.matrix(training.subSetTrain[, -classeIndex]),label = subtrn_labels) 
+subtest_cleaned <- xgb.DMatrix(data = data.matrix(training.subSetTest[, -classeIndex]),label=subtst_label)
+# Case 2 : exclude
+subtrain_exclude <- xgb.DMatrix(data =data.matrix(training.subSetTrain[, -excludeColumns]),label = subtrn_labels) 
+subtest_exclude <- xgb.DMatrix(data = data.matrix(training.subSetTest[, -excludeColumns]),label=subtst_label)
+# Case 3 : PCA all
+subtrain_pca_all <- xgb.DMatrix(data =data.matrix(training.subSetTrain.pca.all),label = subtrn_labels) 
+subtest_pca_all <- xgb.DMatrix(data = data.matrix(training.subSetTest.pca.all),label=subtst_label)
+# Case 4 : PCA subset
+subtrain_pca_subset <- xgb.DMatrix(data =data.matrix(training.subSetTrain.pca.subset),label = subtrn_labels) 
+subtest_pca_subset<- xgb.DMatrix(data = data.matrix(training.subSetTest.pca.subset),label=subtst_label)
+
+
+
+# define the parameters of our xgboost model
+numberOfClasses <- 5
+params <- list(booster = "gbtree", objective = "multi:softprob", eta=0.3, gamma=0, 
+               max_depth=6, min_child_weight=1, subsample=1, colsample_bytree=1,num_class = numberOfClasses)
+
+# we can increase the number of rounds but there no significant improvement and sometimes it's lead to overfitting
+
+xgb.cleaned  <- xgb.train (params = params, data = subtrain_cleaned, nrounds = 50, 
+                   watchlist = list(val=subtest_cleaned,train=subtrain_cleaned), 
+                   early_stopping_rounds = 10, maximize = F , eval_metric = "merror")
+
+xgb.exclude <- xgb.train (params = params, data = subtrain_exclude, nrounds = 50, 
+                   watchlist = list(val=subtest_exclude,train=subtrain_exclude), 
+                   early_stopping_rounds = 10, maximize = F , eval_metric = "merror")
+
+xgb.pca.all <- xgb.train (params = params, data = subtrain_pca_all, nrounds = 50, 
+                   watchlist = list(val=subtest_pca_all,train=subtrain_pca_all), 
+                   early_stopping_rounds = 10, maximize = F , eval_metric = "merror")
+
+xgb.pca.subset <- xgb.train (params = params, data = subtrain_pca_subset, nrounds = 50, 
+                   watchlist = list(val=subtest_pca_subset,train=subtrain_pca_subset), 
+                   early_stopping_rounds = 10, maximize = F , eval_metric = "merror")
+```
+
+## Model examination
+
+Now that we have 8 trained models (4 RF and 4 Xgboost), we will check the accuracies of each.
+
+```{r}
+
+library(caret)
+
+df <- data.frame(c("RF_Include", "RF_Exclude", "RF_PCA_all", "RF_PCA_SUBSET",
+                   "XGB_Include", "XGB_Exclude", "XGB_PCA_all", "XGB_PCA_SUBSET"),
+                 c(round(confusionMatrix(RF.cleaned.pred, training.subSetTest$classe)$overall[2],4),
+                   round(confusionMatrix(RF.exclude.pred, training.subSetTest$classe)$overall[2],4),
+                   round(confusionMatrix(RF.pca_all.pred, training.subSetTest$classe)$overall[2],4),
+                   round(confusionMatrix(RF.pca_subset.pred, training.subSetTest$classe)$overall[2],4),
+                   round(1-xgb.cleaned$evaluation_log$val_merror[xgb.cleaned$niter],4),
+                   round(1-xgb.exclude$evaluation_log$val_merror[xgb.exclude$niter],4),
+                   round(1-xgb.pca.all$evaluation_log$val_merror[xgb.pca.all$niter],4),
+                   round(1-xgb.pca.subset$evaluation_log$val_merror[xgb.pca.subset$niter],4)))
+                 
+
+                 
+
+colnames(df) <- c("model","Accuracy")
+df
+
+```
+
+## Conclusion
+
+As we expected PCA is better than RF that PCA doesn't have a very import positive impact of the accuracy of both algorithms  also since the XGBOOST algorithm is very fast we really don't care about the PCA impact on the time process .
+The `xgb.exclude` performance are slightly better then theothers ones because we get an accuracy of 100%. 
+For the next step we We'll stick with the `xgb.exclude` model as the best model to use for predicting the test set.
+
+Before doing the final prediction we will examine the most important variables used by the `xgb.exclude` model.
+
+```{r}
+#view variable importance plot
+mat <- xgb.importance (feature_names = colnames(training.subSetTrain[, -excludeColumns]),model = xgb.exclude)
+xgb.plot.importance (importance_matrix = mat[1:20]) 
+
+
+```
+
+## OBB error 
+Concerning the Out Of Bag error (OOB) ,as you can see, with the best random forest model we have an estimated OBB error rate of 0.24%.
+```{r}
+ 
+RF.cleaned
+```
+
+However, It is important to highlight the fact in some algorithm like random Forest, each tree is weighted equally, while in boosting methods the weight is very different. Also it is (still) not very usual to "bag" xgboost models and only then you can generate out of bag predictions.
+
+# Test results
+
+
+Let's look at predictions for our best model on the final test set. 
+
+```{r}
+# First make previous transformation that are necessary for Xgboost algorithm
+finaltest <- xgb.DMatrix(data = data.matrix(testing.cleaned[, -excludeColumns]))
+# make the prediction
+final_prediction <- predict(xgb.exclude, newdata = finaltest)
+
+final_prediction.df <- matrix(final_prediction, nrow = numberOfClasses,
+                          ncol=length(final_prediction)/numberOfClasses) %>%
+  t() %>%
+  data.frame() %>%
+  mutate(max_prob = max.col(., "last"))
+
+head(final_prediction.df)
+
+
+```
+
+As you can see, this give us the probability to belong to each class (coded as numeric), that why I added a new column `max_prob` to indicate the class having the highest probability for each line.
+Therefore, the only thing that left to do is to this numerical into the original classes (A to E) that we had in training set and then add that new column to final test set.
+
+```{r}
+final_prediction.df$classe<-recode(final_prediction.df$max_prob,`1`="A",`2`="B",`3`="C",`4`="D",`5`="E")
+
+submission<-cbind(testing.cleaned,final_prediction.df$classe)
+names(submission)[57]<-"classe"
+
+head(submission[,55:57])
+
+write.csv(submission,"final_submission.csv",row.names = F)
+
+```
+
